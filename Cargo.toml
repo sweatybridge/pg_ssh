@@ -1,0 +1,42 @@
+[package]
+name = "pg_ssh"
+version = "0.1.0"
+edition = "2021"
+description = "Run remote commands over SSH from PostgreSQL, with private-key auth kept entirely in memory."
+license = "PostgreSQL"
+repository = "https://example.invalid/pg_ssh"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["pg18"]
+pg_test = []
+pg13 = ["pgrx/pg13", "pgrx-tests/pg13"]
+pg14 = ["pgrx/pg14", "pgrx-tests/pg14"]
+pg15 = ["pgrx/pg15", "pgrx-tests/pg15"]
+pg16 = ["pgrx/pg16", "pgrx-tests/pg16"]
+pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
+pg18 = ["pgrx/pg18", "pgrx-tests/pg18"]
+
+# --- Toolchain version ---
+#
+# pgrx requires the `cargo-pgrx` binary version to match the `pgrx` crate
+# version exactly (patch level included). Pin both to the same version. If you
+# change one, change the other.
+[dependencies]
+pgrx = "=0.19.1"
+ssh2 = "0.9.5"
+
+[dev-dependencies]
+pgrx-tests = "=0.19.1"
+
+[profile.dev]
+panic = "unwind"
+lto = "thin"
+
+[profile.release]
+panic = "unwind"
+opt-level = 3
+lto = "fat"
+codegen-units = 1

@@ -1,0 +1,8 @@
+# pgrx build configuration.
+#
+# The Postgres symbols (and, transitively, libssh2/OpenSSL) are provided by the
+# backend process that dlopens this cdylib, so on macOS we let them resolve at
+# runtime. On Linux pgrx injects the correct rpath for the ephemeral test
+# cluster, so nothing special is required here.
+[target.'cfg(target_os = "macos")']
+rustflags = ["-C", "link-arg=-Wl,-undefined,dynamic_lookup"]

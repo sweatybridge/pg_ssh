@@ -1,0 +1,6 @@
+# pg_ssh control file
+comment = 'Run remote commands over SSH from PostgreSQL (libssh2; in-memory private-key auth)'
+default_version = '0.1.0'
+module_pathname = '$libdir/pg_ssh'
+relocatable = false
+superuser = true
