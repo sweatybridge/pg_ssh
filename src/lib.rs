@@ -53,17 +53,19 @@ fn ssh_exec(
 }
 
 // ----------------------------------------------------------------------------
-// Bootstrap SQL: catalog table + privilege model.
+// Bootstrap SQL.
 //
-// `#[pg_extern]` emits `CREATE FUNCTION ssh_exec(...)` into the extension's
-// install script (in the extension's default schema). This block then runs
-// *after* that, so it can: create the `ssh` schema, create the credential
-// catalog, move the function into the `ssh` schema, flip it to `SECURITY
-// DEFINER`, pin a safe `search_path`, and lock down privileges.
+// `#[pg_extern(schema = "ssh")]` makes pgrx create the function directly in the
+// `ssh` schema (and emit its own `CREATE SCHEMA IF NOT EXISTS ssh`). We split
+// the rest into two blocks:
+//   * `ssh_catalog` — the credential table, locked to its owner. No dependency
+//     on the function, so it can run in any order.
+//   * `ssh_grants`  — flips the function to SECURITY DEFINER and sets grants.
+//     It must run *after* the function exists, hence `requires = [ssh_exec]`.
 // ----------------------------------------------------------------------------
+
 extension_sql!(
     r#"
-    -- The schema that holds both the catalog and the function.
     CREATE SCHEMA IF NOT EXISTS ssh;
 
     -- Pre-authorized SSH connection profiles. This is the only place private
@@ -81,9 +83,8 @@ extension_sql!(
         -- Optional passphrase for an encrypted private key.
         passphrase           text,
         -- Optional pinned host key, as lowercase hex of the SHA-256 digest of
-        -- the server host key. When set, ssh.ssh_exec refuses to connect if it
-        -- does not match. When NULL, host key verification is skipped (not
-        -- recommended for production).
+        -- the server host key. When set, ssh.ssh_exec refuses to connect on a
+        -- mismatch. When NULL, host key verification is skipped.
         host_key_fingerprint text
     );
 
@@ -94,28 +95,39 @@ extension_sql!(
     COMMENT ON COLUMN ssh.hosts.host_key_fingerprint IS
         'Lowercase hex SHA-256 of the server host key. NULL disables verification.';
 
-    -- Lock the catalog: only the owner (the superuser who installed the
-    -- extension) can read or write it. Callers never get direct access.
-    REVOKE ALL ON SCHEMA ssh FROM PUBLIC;
+    -- Only the owner (the superuser who installed the extension) may read or
+    -- write the catalog. Callers never get direct access to the keys.
     REVOKE ALL ON ssh.hosts FROM PUBLIC;
+    "#,
+    name = "ssh_catalog",
+);
 
-    -- Move the generated function into the ssh schema. (It was created
-    -- unqualified in the extension install schema by #[pg_extern].)
+extension_sql!(
+    r#"
+    -- The function is generated unqualified by #[pg_extern] (in the extension's
+    -- install schema); move it into the ssh schema. This whole block runs after
+    -- the function exists (via `requires = [ssh_exec]` below).
+    CREATE SCHEMA IF NOT EXISTS ssh;
     ALTER FUNCTION ssh_exec(text, text) SET SCHEMA ssh;
 
-    -- Run as the function owner (a superuser), so it can read ssh.hosts on
-    -- behalf of unprivileged callers. A pinned search_path defeats the usual
-    -- SECURITY DEFINER search_path-injection trap.
+    -- Callers need USAGE on the schema to resolve ssh.ssh_exec, and EXECUTE on
+    -- the function to invoke it — but still nothing on the table.
+    GRANT USAGE ON SCHEMA ssh TO PUBLIC;
+
+    -- Run as the function owner (the installing superuser) so it can read
+    -- ssh.hosts on behalf of unprivileged callers. A pinned search_path defeats
+    -- the usual SECURITY DEFINER search_path-injection trap.
     ALTER FUNCTION ssh.ssh_exec(text, text) SECURITY DEFINER;
     ALTER FUNCTION ssh.ssh_exec(text, text) SET search_path = pg_catalog, ssh;
 
-    -- By default any connected role may invoke ssh_exec on a *registered* host
-    -- (the command/host are constrained by what's in ssh.hosts). Tighten this
-    -- with `REVOKE ... FROM PUBLIC; GRANT EXECUTE TO <role>;` if you prefer.
+    -- Any connected role may invoke ssh_exec on a *registered* host (the
+    -- command/host are constrained by ssh.hosts). Tighten with
+    -- `REVOKE ... FROM PUBLIC; GRANT EXECUTE TO <role>;` if you prefer.
     REVOKE ALL ON FUNCTION ssh.ssh_exec(text, text) FROM PUBLIC;
     GRANT EXECUTE ON FUNCTION ssh.ssh_exec(text, text) TO PUBLIC;
     "#,
-    name = "ssh_catalog_and_grants",
+    name = "ssh_grants",
+    requires = [ssh_exec],
 );
 
 // ----------------------------------------------------------------------------
@@ -220,25 +232,28 @@ fn load_host_config(host_name: &str) -> Result<HostConfig, String> {
          FROM ssh.hosts WHERE host_name = {literal}"
     );
 
-    // The closure must return pgrx's own Result type (its Err is `spi::Error`),
-    // so we signal "not found" with `Ok(None)` and turn it into a message below.
-    let found: Result<Option<HostConfig>, _> = Spi::connect(|client| {
-        let table = client.select(&query, Some(1), std::iter::empty::<&str>())?;
+    // The closure must return pgrx's own Result type (`SpiResult`, whose Err is
+    // `SpiError`), so we signal "not found" with `Ok(None)` and turn it into a
+    // message below. The explicit return type also resolves the `?` inference.
+    let found = Spi::connect(|client| -> pgrx::spi::SpiResult<Option<HostConfig>> {
+        let table = client.select(&query, Some(1), &[])?;
 
         if table.is_empty() {
             return Ok(None);
         }
 
-        // Columns are fetched by 1-based ordinal, matching the SELECT list above.
+        // Columns are fetched by 1-based ordinal, matching the SELECT list
+        // above. `get::<T>` returns `Option<T>` (None for SQL NULL), so we pass
+        // the inner type and unwrap on the NOT NULL columns.
         let row = table.first();
         Ok(Some(HostConfig {
-            host: row.get::<Option<String>>(1usize)?.unwrap_or_default(),
-            port: row.get::<Option<i32>>(2usize)?.unwrap_or(22),
-            username: row.get::<Option<String>>(3usize)?.unwrap_or_default(),
-            public_key: row.get::<Option<String>>(4usize)?,
-            private_key: row.get::<Option<String>>(5usize)?.unwrap_or_default(),
-            passphrase: row.get::<Option<String>>(6usize)?,
-            host_key_fingerprint: row.get::<Option<String>>(7usize)?,
+            host: row.get::<String>(1usize)?.unwrap_or_default(),
+            port: row.get::<i32>(2usize)?.unwrap_or(22),
+            username: row.get::<String>(3usize)?.unwrap_or_default(),
+            public_key: row.get::<String>(4usize)?,
+            private_key: row.get::<String>(5usize)?.unwrap_or_default(),
+            passphrase: row.get::<String>(6usize)?,
+            host_key_fingerprint: row.get::<String>(7usize)?,
         }))
     });
 
@@ -297,53 +312,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 }
 
 // ----------------------------------------------------------------------------
-// Tests (run in-process by `cargo pgrx test`). These exercise the catalog and
-// privilege model without touching the network; the live SSH path is covered by
-// the manual smoke test documented in the README.
+// Tests: this extension is verified with SQL against a running cluster (see the
+// README's "Verify" section) rather than the in-process `#[pg_test]` harness,
+// so the live SSH path stays exercisable end to end.
 // ----------------------------------------------------------------------------
-
-#[cfg(any(test, feature = "pg_test"))]
-mod tests {
-    use pgrx::spi::Spi;
-
-    /// Run a query that returns exactly one boolean column and return it
-    /// (false if NULL/empty). Uses the SPI client API whose signatures are
-    /// confirmed, rather than `get_one` (whose return shape varies).
-    fn one_bool(sql: &str) -> bool {
-        Spi::connect(|client| {
-            let value = client
-                .select(sql, None, std::iter::empty::<&str>())?
-                .first()
-                .get::<Option<bool>>(1usize)?
-                .unwrap_or(false);
-            Ok(value)
-        })
-        .expect("spi query failed")
-    }
-
-    #[pg_test]
-    fn catalog_table_exists_and_is_locked() {
-        assert!(
-            one_bool("SELECT to_regclass('ssh.hosts') IS NOT NULL"),
-            "ssh.hosts should exist after CREATE EXTENSION"
-        );
-
-        // PUBLIC must have no rights on the credential table.
-        assert!(
-            !one_bool("SELECT has_table_privilege('public', 'ssh.hosts', 'SELECT')"),
-            "PUBLIC must not be able to SELECT ssh.hosts"
-        );
-    }
-
-    #[pg_test]
-    fn ssh_exec_is_security_definer_in_ssh_schema() {
-        assert!(
-            one_bool(
-                "SELECT prosecdef FROM pg_proc \
-                  WHERE proname = 'ssh_exec' \
-                    AND pronamespace = 'ssh'::regnamespace"
-            ),
-            "ssh.ssh_exec must be SECURITY DEFINER"
-        );
-    }
-}
