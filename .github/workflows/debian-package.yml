@@ -1,0 +1,97 @@
+name: Build Debian Packages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Cargo.toml
+  workflow_dispatch:
+
+jobs:
+  build:
+    permissions:
+      contents: read
+    runs-on: ${{ matrix.runner }}
+    container: debian:${{ matrix.debian }}
+    strategy:
+      fail-fast: false
+      matrix:
+        pg_version: [18]
+        debian: [bookworm, trixie]
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup-pgrx
+        with:
+          pg_version: ${{ matrix.pg_version }}
+
+      - name: Build extension
+        run: |
+          . "$HOME/.cargo/env"
+          cargo pgrx package \
+            --pg-config "/usr/lib/postgresql/${{ matrix.pg_version }}/bin/pg_config" \
+            --features "pg${{ matrix.pg_version }}" \
+            --no-default-features
+
+      - name: Create Debian package
+        run: |
+          . "$HOME/.cargo/env"
+          PKG_VERSION=$(grep -oP '^version = "\K[^"]+' Cargo.toml)
+          PG_VERSION=${{ matrix.pg_version }}
+          DEBIAN_CODENAME=${{ matrix.debian }}
+          ARCH=$(dpkg --print-architecture)
+          PKG_NAME="pg-ssh-pg${PG_VERSION}"
+          PKG_DIR="${PKG_NAME}_${PKG_VERSION}-1~${DEBIAN_CODENAME}_${ARCH}"
+          # cargo pgrx package outputs to target/release/pg_ssh-pg$VER/
+          SRC_DIR="target/release/pg_ssh-pg${PG_VERSION}"
+          mkdir -p "${PKG_DIR}/DEBIAN"
+          cp -a "${SRC_DIR}/." "${PKG_DIR}/"
+          cat > "${PKG_DIR}/DEBIAN/control" <<EOF
+           Package: ${PKG_NAME}
+           Version: ${PKG_VERSION}-1
+           Section: database
+           Priority: optional
+           Architecture: ${ARCH}
+           Depends: postgresql-${PG_VERSION}, libssl3 | libssl3t64, libc6
+           Maintainer: pg_ssh contributors
+           Description: Run remote commands over SSH from PostgreSQL
+            pg_ssh exposes SSH functions for PostgreSQL, allowing remote
+            command execution via libssh2 with private-key auth kept
+            entirely in memory (never written to disk).
+          EOF
+          # Remove leading spaces from control file
+          sed -i 's/^ //' "${PKG_DIR}/DEBIAN/control"
+          dpkg-deb --build "${PKG_DIR}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: pg-ssh-pg${{ matrix.pg_version }}-${{ matrix.debian }}-${{ matrix.runner }}
+          path: "*.deb"
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Get version
+        id: version
+        run: echo "value=$(grep -oP '^version = "\K[^"]+' Cargo.toml)" >> "$GITHUB_OUTPUT"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          merge-multiple: true
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ steps.version.outputs.value }}
+          overwrite_files: false
+          files: ./*.deb

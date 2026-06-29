@@ -1,0 +1,52 @@
+name: Setup pgrx
+description: Install dependencies, Rust, PostgreSQL dev files, and cargo-pgrx
+
+inputs:
+  pg_version:
+    description: PostgreSQL major version
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Install build dependencies
+      shell: bash
+      run: |
+        apt-get update
+        apt-get install -y \
+          curl ca-certificates gnupg lsb-release \
+          build-essential pkg-config \
+          libclang-dev \
+          libssl-dev \
+          git
+
+    - name: Add PostgreSQL APT repository
+      shell: bash
+      run: |
+        curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+          | gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
+        echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+          > /etc/apt/sources.list.d/pgdg.list
+        apt-get update
+
+    - name: Install PostgreSQL development files
+      shell: bash
+      run: |
+        apt-get install -y postgresql-server-dev-${{ inputs.pg_version }}
+
+    - name: Install Rust
+      shell: bash
+      run: |
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+        echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+    - name: Install cargo-pgrx
+      shell: bash
+      run: |
+        . "$HOME/.cargo/env"
+        # pgrx requires the `cargo-pgrx` binary to match the `pgrx` crate
+        # version exactly (patch level included). Read it from Cargo.toml so
+        # the two never drift apart. See the comment in Cargo.toml.
+        PGRX_VER=$(grep -oP '^pgrx = "=?\K[0-9][^"]*' Cargo.toml | head -1)
+        cargo install cargo-pgrx --version "${PGRX_VER}" --locked
+        cargo pgrx init "--pg${{ inputs.pg_version }}=/usr/lib/postgresql/${{ inputs.pg_version }}/bin/pg_config"
